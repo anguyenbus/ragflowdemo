@@ -297,6 +297,373 @@ flowchart TB
 
 > **"RAG is like reading the entire library each time you have a question. Wiki is like having a librarian who already synthesized everything."** — Inspired by Karpathy's agentic wiki pattern
 
+### 2.3 The Honest Answer: RAG + Wiki Hybrid
+
+**Nobody serious is replacing RAG.** The "RAG is dead" narrative was clickbait. Production systems use both: each solves different problems.
+
+| Layer | RAG | Wiki |
+|-------|-----|------|
+| **Best for** | Source citations, long-tail queries, large corpora | Repeat questions, synthesized knowledge, cross-references |
+| **Scales to** | 10,000+ documents | ~100-1,000 pages per case |
+| **Retrieval** | Chunk-level vector search | Full-page semantic search |
+| **Knowledge** | Raw, unprocessed | Compiled, cross-linked |
+| **Speed** | Slower (re-process every query) | Faster (pre-compiled) |
+
+#### The Hybrid Architecture
+
+```mermaid
+flowchart TB
+    subgraph Ingest["Document Ingestion"]
+        Docs[Documents] --> Chunk[Chunk & Embed]
+        Docs -->|Full text| WikiBuild[Wiki Ingest Agent]
+        Chunk --> ChunkDB[(Chunk Vector DB)]
+        WikiBuild -->|Async, offline| WikiPages[(Wiki Pages S3)]
+        WikiBuild -->|Updates| WikiIndex[(Wiki Vector Index)]
+    end
+
+    subgraph Query["Query Time"]
+        Q[User Question] --> Router{Query Router}
+        
+        Router -->|Facts, summaries| WikiSearch[Wiki Index Search]
+        Router -->|Source citations| ChunkSearch[Chunk Vector Search]
+        Router -->|Complex analysis| Both[Both Retrievers]
+        
+        WikiSearch -->|Full pages| Synth1[Synthesize]
+        ChunkSearch -->|Chunks| Synth2[Synthesize]
+        Both -->|Wiki + Chunks| Synth3[Synthesize]
+        
+        Synth1 -->|Threshold met| Ans[Answer]
+        Synth2 --> Ans
+        Synth3 --> Ans
+        
+        Ans -->|Optional| Update[Queue for Wiki Update]
+    end
+
+    style Ans fill:#9f9,stroke:#333,stroke-width:2px
+    style WikiPages fill:#69f,stroke:#333
+    style ChunkDB fill:#fc9,stroke:#333
+```
+
+#### Five Hybrid Patterns in Production
+
+**Pattern 1: Wiki on Top, RAG Underneath** (most common)
+
+Wiki serves as structured, high-priority knowledge that always loads. RAG layer handles larger archives when needed. The agent checks wiki first, then falls back to vector search only if wiki doesn't contain what's needed.
+
+> *"The wiki files serve as structured, high-priority knowledge that always loads, while a RAG layer handles larger archives when needed. The agent checks the wiki first, then falls back to vector search only if the wiki doesn't contain what it needs. This preserves the clarity and reliability of the wiki pattern while extending the reach to larger corpora."* — MindStudio
+
+```mermaid
+flowchart LR
+    Q[Question] --> Wiki{Wiki has it?}
+    Wiki -->|Yes - 80%| Fast[Instant from wiki<br/>Fast path]
+    Wiki -->|No - 20%| RAG[Chunk search<br/>Long-tail path]
+    RAG --> Ans[Answer]
+    Fast --> Ans
+    Ans -->|Optional| Queue[Queue for wiki promotion<br/>Next time = fast path]
+
+    style Fast fill:#9f9,stroke:#333
+    style RAG fill:#fc9,stroke:#333
+    style Queue fill:#69f,stroke:#333,stroke-dasharray: 5 5
+```
+
+**Production references**: Denser.ai (chatbot product), MindStudio (default recommendation)
+
+---
+
+**Pattern 2: Vector Index Over Wiki**
+
+Karpathy's pattern works at ~100 pages because index fits in context. At 10,000 pages, you need a retriever in front of wiki.
+
+Solution: Two retrieval surfaces emerge:
+
+| Retrieval Surface | Content | Quality | Recall | Use Case |
+|-------------------|---------|---------|--------|----------|
+| Wiki pages | Synthesized, cross-linked | High | Medium | Common questions, concepts |
+| Raw chunks | Unprocessed source | Medium | High | Long-tail, obscure details |
+
+```mermaid
+flowchart LR
+    Q[Question] --> W[Wiki Page Vector Search<br/>High-quality, low-noise]
+    Q --> C[Chunk Vector Search<br/>High-recall fallback]
+
+    W -->|Top score > threshold| Use[Use wiki pages<br/>Full context]
+    C -->|Otherwise| Use
+
+    style Use fill:#9f9,stroke:#333
+    style W fill:#69f,stroke:#333
+    style C fill:#fc9,stroke:#333
+```
+
+**When to use**: Wiki grows beyond ~100-500 pages (context window limit)
+
+---
+
+**Pattern 3: Triple Retrieval (BM25 + Vector + Graph)**
+
+From the "LLM Wiki v2" gist — production lessons at scale. Wiki provides graph structure via wikilinks, enabling graph traversal effectively for free.
+
+Combined retrieval handles vague conversational queries like *"what did we decide about the pricing thing"*:
+
+1. **BM25 (keyword)**: Exact matches — "section 8-1", "ITAA 1997", "Case #12345"
+2. **Vector (semantic)**: Conceptual similarity — "penalty", "deduction", "remission"
+3. **Graph (structure)**: Linked pages — `[[Pricing]]` → `[[Decisions]]` → `[[Case A Precedent]]`
+
+```mermaid
+flowchart LR
+    Q[Vague query] --> B[BM25<br/>Keyword]
+    Q --> V[Vector<br/>Semantic]
+    Q --> G[Graph<br/>Wikilinks]
+
+    B --> R[Ranked Results]
+    V --> R
+    G --> R
+
+    R --> A[Answer]
+
+    style G fill:#69f,stroke:#333
+    style R fill:#9f9,stroke:#333
+```
+
+**Why it matters**: Conversational queries are often vague. Single retriever fails. Triple retrieval combines signals.
+
+---
+
+**Pattern 4: Pre-generated Q&A Bank (HybridRAG)**
+
+Academic framework (2026) for chatbots with bounded question types.
+
+**Process**:
+1. Ingest raw PDFs → convert to hierarchical chunks
+2. LLM pre-generates plausible Q&A pairs from chunks
+3. At query time: match question to QA bank
+4. If no suitable match → fall back to on-the-fly generation
+
+```mermaid
+flowchart LR
+    subgraph Offline["Offline: Ingest"]
+        Docs[PDFs] --> Chunk[Hierarchical Chunks]
+        Chunk --> LLM[LLM Generate QA]
+        LLM --> QABank[(QA Bank)]
+    end
+
+    subgraph Online["Online: Query"]
+        Q[Question] --> Match[Match to QA Bank]
+        Match -->|Found| QA[Return QA Pair]
+        Match -->|Not found| Gen[Generate from chunks]
+        Gen --> QA
+    end
+
+    style QABank fill:#9f9,stroke:#333
+```
+
+**Same insight as wiki**: Compile once, query many times. Different format: Q&A pairs vs prose pages.
+
+**Best for**: Bounded question types (FAQs, policies, procedures)
+
+---
+
+**Pattern 5: Entropy-Gated Lazy Retrieval (L-RAG)**
+
+Principled routing instead of heuristics. Two-tier context:
+
+| Tier | Content | Token Cost | When Used |
+|------|---------|------------|-----------|
+| **Tier 1** | Compact wiki/summary | Low | Always loaded |
+| **Tier 2** | Detailed chunks | High | Only when needed |
+
+**Gating mechanism**: Predictive entropy
+- Model can answer confidently from Tier 1 → entropy low → skip Tier 2
+- Model uncertain → entropy high → retrieve Tier 2
+
+```mermaid
+flowchart LR
+    Q[Question] --> T1[Tier 1: Wiki<br/>Always loaded]
+    T1 --> Entropy{Entropy}
+
+    Entropy -->|Low<br/>Confident| Ans[Answer from Tier 1<br/>Skip retrieval]
+    Entropy -->|High<br/>Uncertain| T2[Tier 2: Chunk Retrieval<br/>Expensive]
+
+    T2 --> Ans
+
+    style Ans fill:#9f9,stroke:#333
+    style T2 fill:#fc9,stroke:#333
+```
+
+**Replace "compact document summary" with "wiki"** → you have a principled decision mechanism for when to fall back to RAG.
+
+#### What to Actually Build
+
+For existing RAG systems, the lowest-risk path: **Pattern 1 + Pattern 2** (Wiki on top, vector index underneath).
+
+```mermaid
+flowchart LR
+    subgraph Keep["Don't Touch — Existing RAG"]
+        Existing[Existing Vector DB<br/>Chunk Pipeline<br/>Embeddings]
+    end
+
+    subgraph Add["Add On Top — Wiki Layer"]
+        Ingest[Wiki Ingest Agent<br/>Offline/Async]
+        WikiIdx[(Wiki Vector Index<br/>Separate from chunks)]
+        Router[Query Router<br/>Threshold-based]
+    end
+
+    Q[Question] --> Router
+    Router -->|Try first| WikiIdx
+    Router -->|Fallback| Existing
+
+    WikiIdx -->|Score > 0.75| Ans[Answer from Wiki<br/>Full page context]
+    Existing -->|Otherwise| Ans
+
+    Ans -->|If from chunks| Review[Queue for Wiki Promotion<br/>Review before adding]
+
+    style Keep fill:#9f9,stroke:#333
+    style Add fill:#69f,stroke:#333,stroke-width:2px
+    style Ans fill:#fc9,stroke:#333
+```
+
+**Implementation steps**:
+1. **Keep** existing vector DB and chunk pipeline — no changes
+2. **Add** wiki ingestion agent (runs offline/async, not at query time)
+3. **Embed** wiki pages into separate vector index (different collection)
+4. **Query routing**: wiki index first → if top score > threshold (e.g., 0.75) → use wiki → else RAG fallback
+5. **Optional**: when chatbot answers from chunks, queue that Q&A for review and possible promotion to wiki
+
+**Key insight**: You get compounding-knowledge benefit without sacrificing recall or scale. The two systems complement each other.
+
+**Reference implementations to study**:
+| Repo | What to Learn |
+|------|---------------|
+| [nashsu/llm_wiki](https://github.com/nashsu/llm_wiki) | Chat app shape, wiki-on-top pattern |
+| [Beever Atlas](https://github.com/beever/atlas) | Chat memory + wiki layered exactly this way |
+| [llm-wiki-agent](../references/llm-wiki-agent/) | File-based agentic wiki with health/lint |
+| [HybridRAG Paper](https://arxiv.org) | Pre-generated QA bank pattern |
+| [L-RAG Paper](https://arxiv.org) | Entropy-gated retrieval mechanism |
+| MindStudio docs | Wiki + RAG practical guidance |
+
+---
+
+#### Query Routing Strategy
+
+The critical question: **when to use wiki vs RAG?** Three approaches:
+
+**1. Score-based routing (simplest)**
+```python
+wiki_results = wiki_index.search(question, top_k=3)
+if wiki_results[0].score > 0.75:
+    return answer_from_wiki(wiki_results)
+else:
+    return answer_from_rag(question)
+```
+
+**2. Entropy-based routing (principled)**
+```python
+tier1_context = load_wiki_summary(question)
+answer_with_confidence = llm.generate(tier1_context, question)
+entropy = calculate_entropy(answer_with_confidence.logprobs)
+
+if entropy < threshold:
+    return answer_with_confidence  # Confident from wiki alone
+else:
+    tier2_chunks = rag_search(question)
+    return llm.generate(tier1_context + tier2_chunks, question)
+```
+
+**3. Hybrid retrieval (highest quality)**
+```python
+wiki_pages = wiki_index.search(question, top_k=2)
+chunks = chunk_index.search(question, top_k=5)
+
+# Score fusion: prioritize wiki due to higher quality
+combined = merge_results(wiki_pages, chunks, wiki_weight=1.5)
+return llm.generate(combined)
+```
+
+**Recommended**: Start with score-based (Pattern 1). Add entropy-based (Pattern 5) if latency becomes an issue.
+
+---
+
+#### Case Assistant: Fast Path vs Long-Tail
+
+Concrete example of how routing works in a legal case context:
+
+```mermaid
+flowchart TD
+    Q[User Question] --> Type{Question Type}
+
+    Type -->|80%| Common[Common Questions<br/>Fast Path: Wiki]
+    Type -->|20%| Rare[Long-Tail Questions<br/>Fallback: RAG]
+
+    Common --> C1["What is the case about?"]
+    Common --> C2["Who are the parties?"]
+    Common --> C3["What are the key issues?"]
+    Common --> C4["What evidence supports X?"]
+    Common --> C5["What precedents apply?"]
+
+    Rare --> R1["What exactly does page 47 say?"]
+    Rare --> R2["Quote the tribunal's words on Y"]
+    Rare --> R3["How many times does 'penalty' appear?"]
+    Rare --> R4["What's the timestamp on exhibit Z?"]
+
+    C1 --> Wiki[[wiki/facts.md<br/>wiki/issues.md]]
+    C2 --> Wiki[[wiki/parties.md]]
+    C3 --> Wiki[[wiki/issues.md]]
+    C4 --> Wiki[[wiki/evidence.md]]
+    C5 --> Wiki[[wiki/precedents.md]]
+
+    R1 --> Chunk[(Chunk Vector DB<br/>Full document search)]
+    R2 --> Chunk
+    R3 --> Chunk
+    R4 --> Chunk
+
+    Wiki --> Ans[Answer < 2s<br/>Full context]
+    Chunk --> Ans2[Answer < 10s<br/>With citations]
+
+    style Wiki fill:#9f9,stroke:#333
+    style Chunk fill:#fc9,stroke:#333
+    style Ans fill:#69f,stroke:#333
+```
+
+**Distribution**: In a typical case with 100 questions:
+- 80 questions → wiki (facts, parties, issues, evidence, precedents)
+- 20 questions → RAG (specific page quotes, exact wording, counts)
+
+**Cost savings**:
+- Wiki path: ~500 tokens per query = ~$0.001
+- RAG path: ~5,000 tokens per query = ~$0.01
+- Mixed: 80 × $0.001 + 20 × $0.01 = **$0.28 vs $1.00** (72% savings)
+
+---
+
+#### Scale Evolution: When to Move Between Patterns
+
+As your wiki grows, follow this progression:
+
+```mermaid
+timeline
+    title Wiki Scale Evolution
+    section 0-100 pages
+        Pattern 1: Wiki on top of RAG
+        : Wiki fits in context
+        : Direct page lookup
+    section 100-500 pages
+        Pattern 2: Add wiki vector index
+        : Context overflow
+        : Retrieval over wiki pages
+    section 500-1000 pages
+        Pattern 3: Triple retrieval
+        : BM25 + Vector + Graph
+        : Handle vague queries
+    section 1000+ pages
+        Pattern 4 or 5: Specialized
+        : Pre-generated QA bank
+        : Or entropy-gated retrieval
+```
+
+**Key milestones**:
+- **~100 pages**: Wiki index becomes necessary
+- **~500 pages**: Graph structure provides significant value
+- **~1000 pages**: Consider specialized patterns (QA bank or L-RAG)
+
 ---
 
 ## 3. Why Case Assistant Specifically Needs Wiki
