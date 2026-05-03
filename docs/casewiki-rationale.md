@@ -20,95 +20,233 @@ This document explains why wiki-style knowledge synthesis matters for case assis
 
 ## 1. The Problem: Why Current Case Systems Fall Short
 
-### 1.1 Document Pile, Not Knowledge Base
+### 1.1 The RAG Trap: Stateless and Amnesiac
 
-A typical legal case accumulates 50-200+ documents:
+RAG systems work by chunking documents, embedding them, and retrieving relevant chunks at query time. This approach has critical flaws for case-based work.
 
-```mermaid
-timeline
-    title Typical Legal Case Document Accumulation
-    section Intake
-        Initial client forms : 5 docs
-        Notice of Assessment : 1 doc
-    section Audit Phase
-        ATO correspondence : 15 docs
-        Evidence documents : 30 docs
-    section Objection
-        Submission drafts : 20 docs
-        Additional evidence : 25 docs
-    section Review/Appeal
-        Hearing documents : 40 docs
-        Tribunal decisions : 15 docs
-    Total : ~150 documents
-```
-
-**The reality**: Lawyers don't "read" these documents. They search for keywords, hope to find what they need, and miss connections across the file pile.
-
-### 1.2 The RAG Trap: Stateless and Amnesiac
-
-RAG systems (like the current case assistant) work as follows:
+#### How RAG Works Today
 
 ```mermaid
 flowchart LR
-    subgraph Q1["Query 1: What deductions were claimed?"]
-        D1[Documents] --> R1[Retrieval]
-        R1 --> L1[LLM Synthesis]
-        L1 --> A1[Answer]
+    subgraph Upload["Document Upload"]
+        PDF[PDF Documents] --> Parser[Text Extractor]
+        Parser --> Chunker[Chunk Splitter]
+        Chunker --> Embed[Embedding Model]
+        Embed --> VecDB[(Vector Database)]
     end
 
-    subgraph Q2["Query 2: Is the home office deduction allowable?"]
-        D2[Same Documents] --> R2[Retrieval Again]
-        R2 --> L2[LLM Synthesis Again]
-        L2 --> A2[Answer]
+    subgraph Query["User Query"]
+        Q[User Question] --> QEmb[Query Embedding]
+        QEmb --> Search[Similarity Search]
+        Search --> Result[Top K Chunks]
+        Result --> LLM[LLM Synthesis]
+        LLM --> Ans[Answer]
     end
 
-    style A1 fill:#f9f,stroke:#333,stroke-width:2px
-    style A2 fill:#f9f,stroke:#333,stroke-width:2px
+    VecDB -->|Provides chunks| Search
+
+    style Ans fill:#f99,stroke:#333,stroke-width:2px
 ```
 
-**Problem**: Each query re-processes the same documents. Knowledge derived in Query 1 is NOT reused in Query 2. Token cost accumulates. Contradictions between answers may go unnoticed.
+**The fundamental problem**: After the answer is generated, everything is discarded. The knowledge gained from processing those chunks evaporates.
 
-### 1.3 No Cross-Case Learning
+#### The Re-Processing Problem
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant R as RAG System
+    participant D as Documents
+    participant L as LLM
+
+    Note over U,L: Session 1: Morning
+    U->>R: What deductions were claimed?
+    R->>D: Search & retrieve chunks
+    D-->>R: 10 chunks returned
+    R->>L: Synthesize answer
+    L-->>U: $5,500 total claimed
+    Note over R: Knowledge discarded
+
+    Note over U,L: Session 2: Afternoon
+    U->>R: Is home office deductible?
+    R->>D: Search again (same docs)
+    D-->>R: Different 8 chunks
+    R->>L: Synthesize again
+    L-->>U: Yes, if criteria met
+    Note over R: No memory of Session 1
+
+    Note over U,L: Session 3: Next day
+    U->>R: Draft objection letter
+    R->>D: Search yet again
+    D-->>R: Another 12 chunks
+    R->>L: Synthesize from scratch
+    L-->>U: Draft letter
+    Note over R: Third re-processing
+```
+
+**Cost accumulation**: Each query re-processes the same documents. For a case with 100+ questions over its lifecycle:
+
+| Metric | Per Query | Case Total (100 queries) |
+|--------|-----------|--------------------------|
+| Token cost (input) | ~5,000 tokens | ~500,000 tokens |
+| Processing time | 5-10 seconds | 500-1000 seconds |
+| API cost | ~$0.01 | ~$1.00 |
+
+The system pays repeatedly for the same knowledge extraction.
+
+#### The Chunk Isolation Problem
+
+```mermaid
+graph TD
+    Doc[Case Document: 50 pages] --> C1[Chunk 1: pages 1-5]
+    Doc --> C2[Chunk 2: pages 6-10]
+    Doc --> C3[Chunk 3: pages 11-15]
+    Doc --> C4[Chunk 4: pages 16-20]
+    Doc --> C5[Chunk 5: pages 21-25]
+
+    C1 -.->|No link| C2
+    C2 -.->|No link| C3
+    C3 -.->|No link| C4
+    C4 -.->|No link| C5
+
+    Query[Query: Timeline of events] --> R1[Retrieval]
+    R1 -->|Returns| C2
+    R1 -->|Returns| C4
+
+    style C2 fill:#9f9,stroke:#333
+    style C4 fill:#9f9,stroke:#333
+    style C1 fill:#ccc,stroke:#333
+    style C3 fill:#ccc,stroke:#333
+    style C5 fill:#ccc,stroke:#333
+```
+
+**Problem**: Chunks 2 and 4 might contain timeline fragments, but:
+- Chunk 1 (page 5 ends mid-sentence) has context
+- Chunk 3 (pages 11-15) continues the story
+- Chunk 5 (page 21+) has the conclusion
+
+RAG returns isolated fragments. The LLM tries to piece them together, but:
+1. Context is split across chunk boundaries
+2. No cross-references exist between chunks
+3. Important connections are invisible
+
+#### The Contradiction Blind Spot
+
+```mermaid
+flowchart LR
+    subgraph Source1["Document 1: ATO Notice"]
+        D1[Notice date: 2024-10-15<br/>Penalty: 75% of shortfall]
+    end
+
+    subgraph Source2["Document 2: Taxpayer Letter"]
+        D2[Letter date: 2024-09-20<br/>Penalty: 25% - requested remission]
+    end
+
+    subgraph Source3["Document 3: ATO Response"]
+        D3[Response: 2024-11-01<br/>Penalty reduced to 50%]
+    end
+
+    Query[Question: What is current penalty?] --> R1[Retrieval 1]
+    Query --> R2[Retrieval 2]
+    Query --> R3[Retrieval 3]
+
+    R1 -->|Returns| D1
+    R2 -->|Returns| D2
+    R3 -.->|May not match| D3
+
+    LLM[LLM Answer] --> A1["75% (from Notice)"]
+    LLM --> A2["25% (from Letter)"]
+    LLM --> A3["50% (if Response found)"]
+
+    style A1 fill:#f99,stroke:#333
+    style A2 fill:#f99,stroke:#333
+    style A3 fill:#9f9,stroke:#333
+```
+
+**Problem**: RAG has no mechanism to:
+- Track how facts evolve across documents
+- Flag contradictions between sources
+- Maintain a "current state" view
+
+Wiki synthesis does exactly this.
+
+#### No Cross-Case Learning
 
 ```mermaid
 graph LR
-    subgraph Case_A["Case A (Resolved)"]
-        A1[Issue: Home office deduction]
-        A2[Precedent: 50% occupancy allowable]
-        A3[Argument accepted by ATO]
+    subgraph Case_A["Case A (Resolved 2024)"]
+        A1[Issue: Home office]
+        A2[Precedent: 50% allowable]
+        A3[ATO accepted argument]
+        A4[Key witness testimony]
     end
 
-    subgraph Case_B["Case B (New)"]
+    subgraph Case_B["Case B (New 2025)"]
         B1[Same issue: Home office]
         B2[Starting from zero]
-        B3[Must re-research everything]
+        B3[Must re-research]
+        B4[No access to A4]
     end
 
-    A2 -.->|No connection| B2
-    A3 -.->|Knowledge not reused| B3
+    A2 -.->|Not reused| B2
+    A3 -.->|Not visible| B3
+    A4 -.->|Isolated| B4
 
     style Case_A fill:#9f9,stroke:#333
     style Case_B fill:#f99,stroke:#333
 ```
 
-**Reality**: Law firms win arguments in Case A, but Case B starts from zero. No entity tracking. No precedent library. Each case is an isolated silo.
+**Reality**: The firm won the home office argument in Case A. Case B starts from zero. The precedent, the successful arguments, the key testimony—all lost.
 
-### 1.4 The "Second Opinion" Problem
+### 1.2 The Handoff Problem
 
-When a new lawyer takes over a case:
+When a case transfers between lawyers:
 
 ```mermaid
-flowchart LR
-    Senior[Senior Lawyer] -->|Handoff| Junior[Junior Lawyer]
-    Junior -->|Must read| Docs[150+ documents]
-    Docs -->|Weeks later| Understanding[Finally understands case]
-    Senior -->|If still available| Questions[Answer questions]
+sequenceDiagram
+    participant L1 as Lawyer 1 (Leaving)
+    participant L2 as Lawyer 2 (Taking over)
+    participant Docs as Case Documents
+    participant RAG as RAG System
 
-    style Docs fill:#f99,stroke:#333
-    style Understanding fill:#ff9,stroke:#333
+    L1->>L2: Here's the case file
+    L1->>L2: Good luck!
+
+    Note over L2,Docs: Week 1-2: Reading
+    L2->>Docs: Read 150 documents
+    Docs-->>L2: Partial understanding
+
+    Note over L2,RAG: Week 3: Asking questions
+    L2->>RAG: What are the key issues?
+    RAG-->>L2: Partial answer (chunks)
+    L2->>RAG: Who testified about X?
+    RAG-->>L2: I don't see that in chunks
+
+    Note over L2: Week 4: Still missing context
+    L2->>L1: Can you explain your strategy?
+    L1->>L2: Too busy, read the file
+
+    Note over L2: Week 5: Finally competent
+    L2->>L2: I understand the case now
 ```
 
-**Cost**: 20-40 hours of billable time lost per handoff. Risk of missing critical facts.
+**Cost**: 3-5 weeks of lost productivity. Risk of missing critical facts.
+
+With wiki:
+```mermaid
+sequenceDiagram
+    participant L1 as Lawyer 1
+    participant L2 as Lawyer 2
+    participant Wiki as Case Wiki
+
+    L1->>L2: Here's the case wiki
+    L2->>Wiki: Read facts.md (5 min)
+    L2->>Wiki: Read issues.md (5 min)
+    L2->>Wiki: Read strategy.md (5 min)
+
+    Note over L2: 15 minutes later
+    L2->>L2: I understand the case
+```
 
 ---
 
@@ -129,10 +267,10 @@ flowchart TB
     subgraph Wiki["LLM Wiki System"]
         direction TB
         Docs2[(Document Store)] -->|Ingest Agent| WikiPages[Wiki Pages]
-        WikiPages -->|Structured, interlinked| WikiIndex[Index]
-        WikiPages -->|[[wikilinks]]| WikiFacts[Facts]
-        WikiPages -->|[[wikilinks]]| WikiEntities[Entities]
-        WikiPages -->|[[wikilinks]]| WikiIssues[Issues]
+        WikiPages -->|Organized by topic| WikiIndex[Index]
+        WikiPages -->|Cross-referenced| WikiFacts[Facts]
+        WikiPages -->|Cross-referenced| WikiEntities[Entities]
+        WikiPages -->|Cross-referenced| WikiIssues[Issues]
 
         UserQ2[User Question] -->|Read full pages| WikiPages
         WikiPages -->|Synthesize| WikiLLM[LLM]
@@ -149,7 +287,7 @@ flowchart TB
 | Aspect | RAG (Current) | LLM Wiki | Why It Matters for Cases |
 |--------|---------------|----------|--------------------------|
 | **Knowledge lifecycle** | Stateless, re-derived each query | Persistent, compounds over time | Cases span months; knowledge should accumulate |
-| **Cross-references** | None (chunks are isolated) | Bi-directional [[links]] | Legal arguments connect facts → issues → precedents |
+| **Cross-references** | None (chunks are isolated) | Bi-directional links between pages | Legal arguments connect facts to issues to precedents |
 | **Contradictions** | Hidden until query time | Flagged at ingest | Catch inconsistencies before tribunal |
 | **Source attribution** | Chunk references (hard to verify) | Full-page context with citations | Legal requirement: trace every claim to source |
 | **Query cost** | High (re-process every time) | Low (read pre-built pages) | Cases have 100+ queries; cost adds up |
@@ -223,28 +361,6 @@ sequenceDiagram
     Note over User,LLM: 15 seconds, complete context
 ```
 
-### 3.3 Continuity Across Case Lifecycle
-
-```mermaid
-gantt
-    title Case Lifecycle: RAG vs Wiki Knowledge Accumulation
-    dateFormat YYYY-MM-DD
-    section RAG Only
-    Intake        :done, rag1, 2026-01-01, 7d
-    Analysis      :rag2, after rag1, 14d
-    Drafting      :rag3, after rag2, 14d
-    Handoff       :crit, rag4, after rag3, 7d
-
-    section RAG + Wiki
-    Intake        :done, wiki1, 2026-01-01, 7d
-    Wiki Build    :wiki2, after wiki1, 2d
-    Analysis      :wiki3, after wiki2, 7d
-    Drafting      :wiki4, after wiki3, 7d
-    Handoff       :crit, wiki5, after wiki4, 1d
-```
-
-**Time savings**: Wiki approach reduces total case handling time by ~30%.
-
 ---
 
 ## 4. The Agentic Advantage: Multi-Step Reasoning
@@ -303,13 +419,13 @@ stateDiagram-v2
 
 ```mermaid
 flowchart LR
-    subgraph Health["Health Checks (Deterministic)"]
+    subgraph Health["Health Checks"]
         H1[Empty/stub files]
         H2[Index sync]
         H3[Log coverage]
     end
 
-    subgraph Lint["Lint (Semantic LLM)"]
+    subgraph Lint["Lint (Semantic)"]
         L1[Orphan pages]
         L2[Broken links]
         L3[Contradictions]
@@ -323,8 +439,8 @@ flowchart LR
         A4[Suggest sources]
     end
 
-    Health -->|Run every session| Actions
-    Lint -->|Run every 10-15 ingests| Actions
+    Health -->|Every session| Actions
+    Lint -->|Periodic| Actions
 
     style Health fill:#9f9,stroke:#333
     style Lint fill:#fc9,stroke:#333
@@ -341,8 +457,8 @@ flowchart LR
 graph TD
     Bucket[s3://case-wiki-bucket]
 
-    Bucket --> Case1[{case_id_1}/]
-    Bucket --> Case2[{case_id_2}/]
+    Bucket --> Case1[case_id_1]
+    Bucket --> Case2[case_id_2]
 
     Case1 --> Wiki1[wiki/]
     Case1 --> Status1[.wiki-status.json]
@@ -379,66 +495,23 @@ graph TD
     Index --> Issues[issues.md]
     Index --> Evidence[evidence.md]
 
-    Facts -->|[[links]]| Parties
-    Facts -->|[[links]]| Evidence
+    Facts -->|linked to| Parties
+    Facts -->|linked to| Evidence
 
-    Issues -->|[[links]]| Facts
-    Issues -->|[[links]]| Evidence
-    Issues -->|[[links]]| Precedents[precedents.md]
+    Issues -->|linked to| Facts
+    Issues -->|linked to| Evidence
+    Issues -->|linked to| Precedents[precedents.md]
 
-    Parties -->|[[links]]| Timeline[timeline.md]
+    Parties -->|linked to| Timeline[timeline.md]
 
-    Evidence -->|[[links]]| Sources[sources/]
+    Evidence -->|linked to| Sources[sources/]
 
-    Analyses[analyses/] -->|[[links]]| Facts
-    Analyses -->|[[links]]| Issues
+    Analyses[analyses/] -->|linked to| Facts
+    Analyses -->|linked to| Issues
 
     style Index fill:#69f,stroke:#333,stroke-width:2px
     style Issues fill:#f9c,stroke:#333
     style Parties fill:#fc9,stroke:#333
-```
-
-### 5.3 Wiki Page Format Example
-
-```markdown
----
-title: "Case Facts"
-type: facts
-tags: [income-year-2024, salary, home-office, deductions]
-sources: [audit-report, notice-assessment, letter-2024-03-15]
-last_updated: 2026-05-03
-case_id: "uuid-here"
----
-
-## Overview
-Taxpayer is a software engineer claiming home office expenses for the 2023-24 income year. The ATO has disallowed the entire deduction claim citing insufficient evidence.
-
-## Income Items
-- **Salary**: $150,000 from TechCorp Pty Ltd (ABN 12 345 678 901)
-- **Dividends**: $5,000 from Australian Share Fund
-- **Total Assessable Income**: $155,000
-
-## Deductions Claimed
-- **Home office**: $3,500 (50% occupancy, running costs)
-- **Equipment**: $2,000 (laptop $1,800, monitor $200)
-- **Total Claimed**: $5,500
-
-## Key Dates
-- Income year: 2023-24
-- LOD date: 2024-10-15
-- Audit started: 2025-01-10
-- Objection deadline: 2025-12-15
-
-## Related Topics
-- [[Parties]]
-- [[Issues]]
-- [[Evidence]]
-- [[Timeline]]
-
----
-**Status:** DRAFT
-**Reviewed by:** Agent (auto-generated)
-**Word count**: 847
 ```
 
 ---
@@ -458,43 +531,19 @@ stateDiagram-v2
     FAILED --> STALE: Retry available
 
     note right of NEW
-        Show red badge
+        Red badge
         "Build Wiki" button
     end note
 
     note right of CURRENT
-        Show green badge
+        Green badge
         Last updated timestamp
     end note
 
     note right of STALE
-        Show yellow badge
+        Yellow badge
         "Update Wiki" button
     end note
-```
-
-### 6.2 UI Component
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  Case: Smith v FCT (2024)                      [Wiki]   │
-├─────────────────────────────────────────────────────────┤
-│                                                          │
-│  📊 Wiki Status                    🟢 CURRENT            │
-│  ─────────────────────────────────────────────────────  │
-│  Last updated: 2 hours ago (2026-05-03 14:32)           │
-│  Pages: 12 | Sources: 8 | Analyses: 3                  │
-│                                                          │
-│  [View Wiki] [Update Wiki] [Export] [Graph]             │
-│                                                          │
-│  📑 Quick Links                                         │
-│  ─────────────────────────────────────────────────────  │
-│  • [[Facts]] - Income, deductions, key dates            │
-│  • [[Parties]] - Taxpayer, ATO officers, representatives │
-│  • [[Issues]] - Home office, penalty, interest          │
-│  • [[Evidence]] - Key documents by issue                │
-│                                                          │
-└─────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -506,19 +555,19 @@ stateDiagram-v2
 ```mermaid
 graph TD
     subgraph Case_A["Case A: Smith 2024"]
-        A1[[wiki/entities/Smith-John.md]]
-        A2[[wiki/entities/ATO-Sydney.md]]
+        A1[entities/Smith-John.md]
+        A2[entities/ATO-Sydney.md]
     end
 
     subgraph Case_B["Case B: Jones 2025"]
-        B1[[wiki/entities/Jones-Mary.md]]
-        B2[[wiki/entities/ATO-Sydney.md]]
+        B1[entities/Jones-Mary.md]
+        B2[entities/ATO-Sydney.md]
     end
 
     subgraph Global["Global Knowledge Base"]
-        G1[[ATP-Branch: Sydney]] -.-> A2
+        G1[ATO-Branch: Sydney] -.-> A2
         G1 -.-> B2
-        G2[[Precedent: Home Office 50%]] -.-> A1
+        G2[Precedent: Home Office 50%] -.-> A1
         G2 -.-> B1
     end
 
@@ -554,45 +603,6 @@ According to [Morgan Lewis](https://www.morganlewis.com/news/2026/01/legal-techs
 
 **Interpretation**: The market is moving toward structured, reusable knowledge assets—exactly what LLM Wiki provides.
 
-### 8.2 Competitive Landscape
-
-```mermaid
-graph TD
-    subgraph Existing["Existing Platforms"]
-        L1[Lawzana Flow]
-        L2[Paxton]
-        L3[Lexis+ AI]
-    end
-
-    subgraph Features["Capabilities"]
-        F1[Case learning]
-        F2[Research + drafting]
-        F3[Source verification]
-        F4[Wiki synthesis]
-        F5[Entity tracking]
-        F6[Cross-linking]
-    end
-
-    subgraph CaseWiki["CaseWiki (Proposed)"]
-        CW1[All of above]
-        CW2[Plus: Per-case isolation]
-        CW3[Plus: Graph visualization]
-        CW4[Plus: Self-healing]
-    end
-
-    L1 --> F1
-    L2 --> F2
-    L2 --> F3
-    CaseWiki --> F1
-    CaseWiki --> F2
-    CaseWiki --> F3
-    CaseWiki --> F4
-    CaseWiki --> F5
-    CaseWiki --> F6
-
-    style CaseWiki fill:#9f9,stroke:#333,stroke-width:3px
-```
-
 ---
 
 ## 9. Beyond Legal: Universal Case Pattern
@@ -609,29 +619,6 @@ graph TD
 | **Audit** | Financial audits | Companies, auditors | Period end, fieldwork | Financial statements | Findings, recommendations |
 
 **Universal pattern**: All case-based systems track entities, events, documents, and issues. Wiki abstracts this structure. RAG doesn't.
-
-### 9.2 Knowledge Graph Visualization
-
-```mermaid
-graph TD
-    subgraph AnyCase["Generic Case Structure"]
-        Case[Case] --> Entities[Entities]
-        Case --> Events[Events]
-        Case --> Docs[Documents]
-        Case --> Issues[Issues]
-
-        Entities -->|[[link]]| Facts[Facts]
-        Events -->|[[link]]| Timeline[Timeline]
-        Docs -->|[[link]]| Evidence[Evidence]
-        Issues -->|[[link]]| Resolutions[Resolutions]
-
-        Facts -->|[[link]]| Issues
-        Evidence -->|[[link]]| Issues
-        Timeline -->|[[link]]| Facts
-    end
-
-    style Case fill:#69f,stroke:#333,stroke-width:2px
-```
 
 ---
 
@@ -713,25 +700,6 @@ gantt
 | Handoff errors | 25% | 5% | -80% |
 | Source attribution accuracy | 70% | 98% | +40% |
 
-### 11.3 Revenue Opportunities
-
-```mermaid
-mindmap
-  root((Revenue))
-    Wiki_Export
-      Structured_case_summary
-      Charge_$500_per_case
-    Precedent_Library
-      Reusable_issue_pages
-      Subscription_access
-    Training
-      New_lawyer_onboarding
-      Reduced_from_2_weeks_to_2_days
-    Client_Portal
-      Self_service_case_view
-      Reduced_inquiries
-```
-
 ---
 
 ## 12. Conclusion
@@ -743,8 +711,8 @@ mindmap
    - Wiki: Persistent, compounds over time
 
 2. **Legal cases have structure. Wiki maps to it.**
-   - Parties, Issues, Evidence, Timeline → Wiki pages
-   - RAG chunks are islands; Wiki pages are a network
+   - Parties, Issues, Evidence, Timeline become Wiki pages
+   - RAG chunks are isolated islands
 
 3. **Knowledge should accumulate, not evaporate.**
    - Each document makes wiki richer
@@ -779,12 +747,12 @@ timeline
         Document extraction : Week 3
         Page planning LLM : Week 4
         Page generation : Week 5
-        Index & log updates : Week 6
+        Index and log updates : Week 6
     section Phase 3: Query Agent
         Wiki search : Week 7
         Context aggregation : Week 8
         Answer synthesis : Week 9
-    section Phase 4: UI & Integration
+    section Phase 4: UI and Integration
         Status indicator : Week 10
         Wiki viewer : Week 11
         Case integration : Week 12
@@ -815,14 +783,8 @@ timeline
 - [LlmWiki Reference](../references/LlmWiki/) - Tauri-based desktop wiki with LangGraph.js
 - [Karpathy's llm.wiki Concept](https://github.com/karpathy/llm.wiki) - Original agentic wiki pattern
 
-### Industry Sources
-
-- [Lawzana Flow - AI Case Management](https://www.relevantaudience.com/ai/the-best-ai-tools-for-law-firms-in-2026-a-definitive-guide/)
-- [Paxton - AI Legal Assistant](https://monday.com/blog/ai-agents/ai-for-lawyers/)
-- [Summize - 2026 Legal Tech Trends](https://www.summize.com/resources/2026-legal-tech-trends-ai-clm-and-smarter-workflows)
-
 ---
 
-*Document Version: 1.0*
+*Document Version: 1.1*
 *Last Updated: 2026-05-03*
 *Author: Case Assistant Team*
