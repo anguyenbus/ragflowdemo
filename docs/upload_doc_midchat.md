@@ -44,7 +44,7 @@ stateDiagram-v2
         Creates:
         - OpenSearch index
         - S3 prefix
-        - DynamoDB metadata
+        - DynamoDB metadata (optional - can use OpenSearch)
     end note
 
     note right of Ready
@@ -66,7 +66,7 @@ stateDiagram-v2
         All data deleted:
         - OpenSearch index
         - S3 documents
-        - DynamoDB metadata
+        - DynamoDB metadata (optional - can use OpenSearch)
     end note
 ```
 
@@ -89,7 +89,7 @@ sequenceDiagram
     participant Chunking as Chunking Service
     participant Bedrock as Bedrock Embeddings
     participant OpenSearch as OpenSearch
-    participant DynamoDB as DynamoDB
+    participant DynamoDB as DynamoDB (optional)
     participant SNS as SNS Notifications
     participant WebSocket as WebSocket Service
 
@@ -108,9 +108,9 @@ sequenceDiagram
 
     Parser-->>Lambda: Parsed text + metadata
 
-    Lambda->>DynamoDB: UPDATE document status: PROCESSING
-    Lambda->>Chunking: Chunk document (2000/1500/1000 tokens)
-    Note over Chunking: Three chunk types:<br/>- Summary (2000t)<br/>- Detail (1500t)<br/>- Fact (1000t)
+    Lambda->>DynamoDB: UPDATE document status: PROCESSING (optional - can use OpenSearch)
+    Lambda->>Chunking: Chunk document (dynamic sizing)
+    Note over Chunking: Adaptive chunking based on<br/>content type and structure
 
     Chunking-->>Lambda: Array of chunks
 
@@ -121,7 +121,7 @@ sequenceDiagram
         Note over OpenSearch: Index: vector_store_session_{id}<br/>k-NN vector search enabled
     end
 
-    Lambda->>DynamoDB: UPDATE document status: READY
+    Lambda->>DynamoDB: UPDATE document status: READY (optional - can use OpenSearch)
     Lambda->>SNS: Publish document_ready event
 
     SNS->>WebSocket: Broadcast status update
@@ -174,7 +174,7 @@ stateDiagram-v2
 
     note right of Uploaded
         File in S3
-        Metadata in DynamoDB
+        Metadata in DynamoDB (optional - can use OpenSearch)
         Job queued
     end note
 
