@@ -33,30 +33,15 @@ stateDiagram-v2
 
     Chatting --> QnA: User asks about case documents
     QnA --> Chatting: Answer provided
+    Chatting --> DocDeleting: User deletes document
+    DocDeleting --> Chatting: Document removed from case
 
     Chatting --> [*]: Session ends (case persists)
     CaseSelected --> [*]: User switches case
 
-    note right of CaseSelected
-        Case = workspace container
-        All docs belong to case
-        Multiple sessions per case
-    end note
-
-    note right of DocUploading
-        Non-blocking
-        User can continue chatting
-        Doc visible to all case sessions
-    end note
-
-    note right of QnA
-        Queries use OpenSearch
-        Scoped to case documents only
-    end note
-
-    Chatting --> DocDeleting: User deletes document
-    DocDeleting --> Chatting: Document removed from case
-    DocDeleting --> DocDeleting: Delete fails (error)
+    note right of CaseSelected : Case workspace container - Multiple sessions per case
+    note right of DocUploading : Non-blocking - Doc visible to all case sessions
+    note right of QnA : OpenSearch vector search - Scoped to case documents only
 ```
 
 ---
@@ -77,72 +62,56 @@ sequenceDiagram
     participant DocRegistry as Document Status Registry
     participant WebSocket as WebSocket Service
 
-    Note over User,WebSocket: Phase 1: Initial Chat (within Case)
-    User->>WebApp: Select case "Case-001", send "Hello"
+    Note over User,WebSocket: Phase 1: Initial Chat within Case
+    User->>WebApp: Select case Case-001, send Hello
     WebApp->>APIGW: POST /cases/{case_id}/sessions/{session_id}/messages
-    APIGW->>ChatLambda: Invoke with message + case_id
+    APIGW->>ChatLambda: Invoke with message and case_id
     ChatLambda->>Bedrock: Generate response
     Bedrock-->>ChatLambda: LLM response
     ChatLambda-->>APIGW: Response
     APIGW-->>WebApp: 200 OK
-    WebApp-->>User: Display "Hello! Working on Case-001"
+    WebApp-->>User: Display Hello response
 
-    Note over User,WebSocket: Phase 2: Document Upload (case-scoped)
+    Note over User,WebSocket: Phase 2: Document Upload case-scoped
     User->>WebApp: Select document.pdf for Case-001
     WebApp->>APIGW: POST /cases/{case_id}/documents
-    APIGW-->>WebApp: Presigned S3 URL (case-scoped prefix)
-    WebApp->>S3: Upload file to s3://.../cases/{case_id}/
+    APIGW-->>WebApp: Presigned S3 URL
+    WebApp->>S3: Upload file to S3 cases prefix
 
     S3->>Ingestion: Trigger ingestion
-    Ingestion->>DocRegistry: CREATE document: case_id, status=PROCESSING
+    Ingestion->>DocRegistry: CREATE document case_id status PROCESSING
 
-    Note over User,WebSocket: User continues chatting during upload
-    User->>WebApp: "I'll ask questions after upload"
+    User->>WebApp: Continue chatting during upload
     WebApp->>APIGW: POST /cases/{case_id}/sessions/{session_id}/messages
-    APIGW->>ChatLambda: Invoke (no new docs indexed yet)
+    APIGW->>ChatLambda: Invoke
     ChatLambda->>Bedrock: Generate response
-    Bedrock-->>ChatLambda: "Sure, I'll let you know when ready"
+    Bedrock-->>ChatLambda: Response
     ChatLambda-->>WebApp: Response
     WebApp-->>User: Display response
 
-    Note over Ingestion,WebSocket: Background processing (case-scoped)
-    Ingestion->>Ingestion: Parse, chunk, embed
-    Ingestion->>OpenSearch: Index to case-specific index/vector_store_case_{case_id}
-    Ingestion->>DocRegistry: UPDATE document: status=READY
-    DocRegistry->>WebSocket: Broadcast status change (case_id)
-    WebSocket->>WebApp: document.status_update: READY for Case-001
-    WebApp-->>User: Show "Document ready for Case-001"
+    Note over Ingestion,WebSocket: Background processing case-scoped
+    Ingestion->>Ingestion: Parse chunk embed
+    Ingestion->>OpenSearch: Index to vector_store_case_{case_id}
+    Ingestion->>DocRegistry: UPDATE document status READY
+    DocRegistry->>WebSocket: Broadcast status change
+    WebSocket->>WebApp: document.status_update READY
+    WebApp-->>User: Show Document ready
 
     Note over User,WebSocket: Phase 3: Q&A on case documents
-    User->>WebApp: "What are the key points in the PDF?"
+    User->>WebApp: What are the key points in the PDF?
     WebApp->>APIGW: POST /cases/{case_id}/sessions/{session_id}/messages
-    APIGW->>ChatLambda: Invoke with query + case_id
+    APIGW->>ChatLambda: Invoke with query and case_id
 
-    ChatLambda->>OpenSearch: Vector search within case_{case_id} index
-    Note over OpenSearch: Scoped search:<br/>Only returns chunks<br/>from Case-001 documents
+    ChatLambda->>OpenSearch: Vector search within case index
     OpenSearch-->>ChatLambda: Retrieved chunks
 
     ChatLambda->>Bedrock: Generate answer with context
-    Note over Bedrock: RAG pattern:<br/>Query + Retrieved Chunks → Answer
     Bedrock-->>ChatLambda: Generated answer
     ChatLambda-->>APIGW: Response with sources
     APIGW-->>WebApp: 200 OK
-    WebApp-->>User: Display answer + source citations
+    WebApp-->>User: Display answer with source citations
 
-    Note over User,WebSocket: User asks follow-up questions
-    loop Follow-up Q&A
-        User->>WebApp: Next question
-        WebApp->>APIGW: POST /cases/{case_id}/sessions/{session_id}/messages
-        APIGW->>ChatLambda: Invoke
-        ChatLambda->>OpenSearch: Search case_{case_id}
-        OpenSearch-->>ChatLambda: Chunks
-        ChatLambda->>Bedrock: Generate
-        Bedrock-->>ChatLambda: Answer
-        ChatLambda-->>WebApp: Response
-        WebApp-->>User: Display
-    end
-
-    Note over User,WebSocket: Phase 4: Delete Document (mid-session)
+    Note over User,WebSocket: Phase 4: Delete Document mid-session
     User->>WebApp: Click delete on policy.pdf
     WebApp->>APIGW: DELETE /cases/{case_id}/documents/{document_id}
     APIGW->>DocRegistry: Get document metadata
@@ -152,26 +121,37 @@ sequenceDiagram
     OpenSearch-->>APIGW: Chunks deleted
 
     APIGW->>S3: MOVE file to Glacier Deep Archive
-    Note over S3: Soft delete for compliance:<br/>Original → Glacier Deep Archive<br/>Retention: 7 years
-    S3-->>APIGW: File archived
+    S3-->>APIGW: File archived for compliance 7 years
 
-    APIGW->>DocRegistry: UPDATE document: status=DELETED, deleted_at=timestamp
+    APIGW->>DocRegistry: UPDATE document status DELETED
     DocRegistry->>WebSocket: Broadcast deletion
-    WebSocket->>WebApp: document.deleted: doc_xyz789
+    WebSocket->>WebApp: document.deleted notification
     APIGW-->>WebApp: 204 No Content
-    WebApp-->>User: Show "Document removed from Case-001"
+    WebApp-->>User: Show Document removed
 
     Note over User,WebSocket: Future queries exclude deleted doc
-    User->>WebApp: "What are the key points now?"
+    User->>WebApp: What are the key points now?
     WebApp->>APIGW: POST /cases/{case_id}/sessions/{session_id}/messages
     APIGW->>ChatLambda: Invoke
-    ChatLambda->>OpenSearch: Search case_{case_id}
-    Note over OpenSearch: Deleted document<br/>chunks excluded<br/>from results
+    ChatLambda->>OpenSearch: Search case index
     OpenSearch-->>ChatLambda: Remaining chunks only
     ChatLambda->>Bedrock: Generate
-    Bedrock-->>ChatLambda: Answer (without deleted doc sources)
+    Bedrock-->>ChatLambda: Answer without deleted sources
     ChatLambda-->>WebApp: Response
-    WebApp-->>User: Display answer (no citation to deleted doc)
+    WebApp-->>User: Display answer
+
+    Note over User,WebSocket: Follow-up Q&A loop
+    loop Follow-up Q&A
+        User->>WebApp: Next question
+        WebApp->>APIGW: POST messages
+        APIGW->>ChatLambda: Invoke
+        ChatLambda->>OpenSearch: Search
+        OpenSearch-->>ChatLambda: Chunks
+        ChatLambda->>Bedrock: Generate
+        Bedrock-->>ChatLambda: Answer
+        ChatLambda-->>WebApp: Response
+        WebApp-->>User: Display
+    end
 ```
 
 ---
