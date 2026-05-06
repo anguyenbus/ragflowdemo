@@ -53,6 +53,10 @@ stateDiagram-v2
         Queries use OpenSearch
         Scoped to case documents only
     end note
+
+    Chatting --> DocDeleting: User deletes document
+    DocDeleting --> Chatting: Document removed from case
+    DocDeleting --> DocDeleting: Delete fails (error)
 ```
 
 ---
@@ -137,6 +141,37 @@ sequenceDiagram
         ChatLambda-->>WebApp: Response
         WebApp-->>User: Display
     end
+
+    Note over User,WebSocket: Phase 4: Delete Document (mid-session)
+    User->>WebApp: Click delete on policy.pdf
+    WebApp->>APIGW: DELETE /cases/{case_id}/documents/{document_id}
+    APIGW->>DocRegistry: Get document metadata
+    DocRegistry-->>APIGW: Document found
+
+    APIGW->>OpenSearch: DELETE all chunks for document_id
+    OpenSearch-->>APIGW: Chunks deleted
+
+    APIGW->>S3: MOVE file to Glacier Deep Archive
+    Note over S3: Soft delete for compliance:<br/>Original → Glacier Deep Archive<br/>Retention: 7 years
+    S3-->>APIGW: File archived
+
+    APIGW->>DocRegistry: UPDATE document: status=DELETED, deleted_at=timestamp
+    DocRegistry->>WebSocket: Broadcast deletion
+    WebSocket->>WebApp: document.deleted: doc_xyz789
+    APIGW-->>WebApp: 204 No Content
+    WebApp-->>User: Show "Document removed from Case-001"
+
+    Note over User,WebSocket: Future queries exclude deleted doc
+    User->>WebApp: "What are the key points now?"
+    WebApp->>APIGW: POST /cases/{case_id}/sessions/{session_id}/messages
+    APIGW->>ChatLambda: Invoke
+    ChatLambda->>OpenSearch: Search case_{case_id}
+    Note over OpenSearch: Deleted document<br/>chunks excluded<br/>from results
+    OpenSearch-->>ChatLambda: Remaining chunks only
+    ChatLambda->>Bedrock: Generate
+    Bedrock-->>ChatLambda: Answer (without deleted doc sources)
+    ChatLambda-->>WebApp: Response
+    WebApp-->>User: Display answer (no citation to deleted doc)
 ```
 
 ---
@@ -201,12 +236,29 @@ sequenceDiagram
 }
 ```
 
+### 3.4 Document Deleted (WebSocket)
+
+**Direction:** System → User (async)
+
+```json
+{
+    "type": "document.deleted",
+    "case_id": "case_abc123",
+    "document": {
+        "document_id": "doc_xyz789",
+        "filename": "policy.pdf",
+        "status": "deleted"
+    }
+}
+```
+
 **Status Values:**
 | Status | Description |
 |--------|-------------|
 | `uploading` | File being uploaded |
 | `processing` | Parse/chunk/embed in progress |
 | `ready` | Indexed and ready for queries |
+| `deleted` | Soft deleted: excluded from queries, archived to Glacier (7-year retention) |
 | `error` | Processing failed |
 
 ---
@@ -284,7 +336,31 @@ metadata: {"tags": ["policy"]}
 }
 ```
 
-### 4.4 Get Session Messages
+### 4.4 Delete Document from Case
+
+**DELETE** `/api/v1/cases/{case_id}/documents/{document_id}`
+
+**Response:** `204 No Content`
+
+**Deletion Policy:**
+
+| Type | Description | Retention |
+|------|-------------|-----------|
+| **Soft Delete** | Document excluded from queries, data archived to S3 Glacier Deep Archive for compliance | 7 years |
+| **Hard Delete** | Permanent removal after retention threshold met | After 7 years |
+
+**Side effects (Soft Delete):**
+- Removes all chunks from OpenSearch case index (immediate exclusion from queries)
+- Moves file from S3 case prefix to Glacier Deep Archive
+- Updates Document Status Registry to `deleted` with `deleted_at` timestamp
+- Broadcasts WebSocket notification to all case sessions
+
+**Scheduled cleanup (Hard Delete):**
+- Lambda function runs daily to check `deleted_at` timestamps
+- Documents older than 7 years are permanently deleted from Glacier
+- Record removed from Document Status Registry
+
+### 4.5 Get Session Messages
 
 **GET** `/api/v1/cases/{case_id}/sessions/{session_id}/messages`
 
@@ -317,10 +393,14 @@ metadata: {"tags": ["policy"]}
 1. **Case-scoped documents**: All documents belong to a case, not a session
 2. **Multiple sessions per case**: User can have multiple conversations within same case
 3. **Non-blocking upload**: Chat continues during document processing
-4. **Async notifications**: WebSocket updates when doc ready (case-scoped)
+4. **Async notifications**: WebSocket updates when doc ready/deleted (case-scoped)
 5. **RAG pattern**: Vector search + LLM generation for Q&A
 6. **Scoped search**: Queries only return documents from the same case
 7. **Source attribution**: Answers include document citations
+8. **Mid-session delete**: Documents can be deleted during active session
+9. **Soft delete with compliance**: Deleted docs archived to Glacier Deep Archive (7-year retention)
+10. **Immediate exclusion**: Deleted docs excluded from all future queries immediately
+11. **Scheduled hard delete**: Lambda permanently removes documents after 7 years
 
 ---
 
